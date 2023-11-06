@@ -5,14 +5,12 @@ use regex::Regex;
 use smallvec::SmallVec;
 use tracing::warn;
 
-mod filters;
-mod fs;
-mod git;
-pub(super) mod language;
+//mod filters;
+//mod fs;
+//mod git;
+//pub(super) mod language;
 
-pub use filters::*;
-pub use fs::FileWalker;
-pub use git::GitWalker;
+pub use crate::git::GitWalker;
 
 use crate::background::SyncPipes;
 
