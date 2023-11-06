@@ -189,6 +189,8 @@ impl<'de> Deserialize<'de> for RepoRef {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Repository {
     /// Path to the physical location of the repo root
     pub disk_path: PathBuf,
@@ -211,6 +213,14 @@ pub struct Repository {
     /// Custom file filter overrides
     #[serde(default)]
     pub file_filter: FileFilterConfig,
+
+    /// Sync lock
+    #[serde(skip)]
+    pub locked: bool,
+
+    /// Current user-readable status of syncing
+    #[serde(skip)]
+    pub pub_sync_status: SyncStatus,
 }
 
 impl Repository {
@@ -222,13 +232,16 @@ impl Repository {
     pub(crate) fn local_from(reporef: &RepoRef) -> Self {
         let disk_path = reporef.local_path().unwrap();
 
+        
         Self {
             sync_status: SyncStatus::Queued,
+            pub_sync_status: SyncStatus::Queued,
             last_index_unix_secs: 0,
             last_commit_unix_secs: 0,
             most_common_lang: None,
             branch_filter: None,
             file_filter: Default::default(),
+            locked: false,
             disk_path,
         }
     }
