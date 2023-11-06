@@ -8,8 +8,7 @@ use std::{
     time::SystemTime,
 };
 use tracing::debug;
-
-use crate::state::get_relative_path;
+use relative_path::RelativePath;
 
 pub(crate) mod iterator;
 use iterator::language;
@@ -27,52 +26,74 @@ pub enum Backend {
 // Repository identifier
 #[derive(Hash, Eq, PartialEq, Debug, Clone)]
 pub struct RepoRef {
-    pub backend: Backend,
     pub name: String,
 }
 
+pub fn from_path<P: ?Sized + AsRef<path::Path>>(path: &P) -> Result<&RelativePath, FromPathError> {
+    use std::path::Component::*;
+
+    let other = path.as_ref();
+
+    let s = match other.to_str() {
+        Some(s) => s,
+        None => return Err(FromPathErrorKind::NonUtf8.into()),
+    };
+
+    let rel = RelativePath::new(s);
+
+    // check that the component compositions are equal.
+    for (a, b) in other.components().zip(rel.components()) {
+        match (a, b) {
+            (Prefix(_), _) | (RootDir, _) => return Err(FromPathErrorKind::NonRelative.into()),
+            (CurDir, Component::CurDir) => continue,
+            (ParentDir, Component::ParentDir) => continue,
+            (Normal(a), Component::Normal(b)) if a == b => continue,
+            _ => return Err(FromPathErrorKind::BadSeparator.into()),
+        }
+    }
+
+    Ok(rel)
+}
+
+pub fn get_relative_path<P>(path: &Path, base: P) -> PathBuf
+where
+    P: AsRef<Path>,
+{
+    RelativePath::from_path(path)
+        .map(|rp| rp.to_logical_path(base))
+        .unwrap_or_else(|_| path.to_owned())
+}
+
 impl RepoRef {
-    pub fn new(backend: Backend, name: &(impl AsRef<str> + ?Sized)) -> Result<Self, RepoError> {
-        use Backend::*;
+    pub fn new(name: &(impl AsRef<str> + ?Sized)) -> Result<Self, RepoError> {
+        let path = Path::new(name.as_ref());
 
-        match backend {
-            Github => Ok(RepoRef {
-                backend,
-                name: name.as_ref().to_owned(),
-            }),
-            Local => {
-                let path = Path::new(name.as_ref());
+        if !path.is_absolute() {
+            return Err(RepoError::NonAbsoluteLocal);
+        }
 
-                if !path.is_absolute() {
-                    return Err(RepoError::NonAbsoluteLocal);
-                }
-
-                for component in path.components() {
-                    use std::path::Component::*;
-                    match component {
-                        CurDir | ParentDir => return Err(RepoError::InvalidPath),
-                        _ => continue,
-                    }
-                }
-
-                Ok(RepoRef {
-                    backend,
-                    name: name.as_ref().to_owned(),
-                })
+        for component in path.components() {
+            use std::path::Component::*;
+            match component {
+                CurDir | ParentDir => return Err(RepoError::InvalidPath),
+                _ => continue,
             }
         }
+
+        Ok(RepoRef {
+            name: name.as_ref().to_owned(),
+        })
     }
 
     pub fn from_components(root: &Path, components: Vec<String>) -> Result<Self, RepoError> {
         let refstr = components.join("/");
         let pathstr = match refstr.trim_start_matches('/').split_once('/') {
-            Some(("github.com", name)) => return RepoRef::new(Backend::Github, name),
             Some(("local", name)) => name,
             _ => &refstr,
         };
 
         let local_path = get_relative_path(Path::new(pathstr), root);
-        Self::new(Backend::Local, &local_path.to_string_lossy())
+        Self::new(&local_path.to_string_lossy())
     }
 
     pub fn backend(&self) -> Backend {
@@ -92,32 +113,19 @@ impl RepoRef {
     }
 
     pub fn indexed_name(&self) -> String {
-        // Local repos indexed as: dirname
-        // Github repos indexed as: github.com/org/repo
-        match self.backend {
-            Backend::Local => Path::new(&self.name)
-                .file_name()
-                .expect("last component is `..`")
-                .to_string_lossy()
-                .into(),
-            Backend::Github => format!("{}", self),
-        }
+        Path::new(&self.name)
+            .file_name()
+            .expect("last component is `..`")
+            .to_string_lossy()
+            .into()
     }
 
     pub fn display_name(&self) -> String {
-        match self.backend {
-            // org_name/repo_name
-            Backend::Github => self.name.to_owned(),
-            // repo_name
-            Backend::Local => self.indexed_name(),
-        }
+        self.indexed_name()
     }
 
     pub fn local_path(&self) -> Option<PathBuf> {
-        match self.backend {
-            Backend::Local => Some(PathBuf::from(&self.name)),
-            _ => None,
-        }
+        Some(PathBuf::from(&self.name))
     }
 }
 
@@ -131,7 +139,6 @@ impl<P: AsRef<Path>> From<&P> for RepoRef {
     fn from(path: &P) -> Self {
         assert!(path.as_ref().is_absolute());
         RepoRef {
-            backend: Backend::Local,
             name: path.as_ref().to_string_lossy().to_string(),
         }
     }
@@ -148,10 +155,8 @@ impl FromStr for RepoRef {
 
     fn from_str(refstr: &str) -> Result<Self, Self::Err> {
         match refstr.trim_start_matches('/').split_once('/') {
-            // github.com/...
-            Some(("github.com", name)) => RepoRef::new(Backend::Github, name),
             // local/...
-            Some(("local", name)) => RepoRef::new(Backend::Local, name),
+            Some(("local", name)) => RepoRef::new(name),
             _ => Err(RepoError::InvalidBackend),
         }
     }
@@ -159,10 +164,7 @@ impl FromStr for RepoRef {
 
 impl Display for RepoRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.backend() {
-            Backend::Github => write!(f, "github.com/{}", self.name()),
-            Backend::Local => write!(f, "local/{}", self.name()),
-        }
+        write!(f, "local/{}", self.name())
     }
 }
 
@@ -191,9 +193,6 @@ pub struct Repository {
     /// Path to the physical location of the repo root
     pub disk_path: PathBuf,
 
-    /// Configuration of the remote to sync with
-    pub remote: RepoRemote,
-
     /// Current user-readable status of syncing
     pub sync_status: SyncStatus,
 
@@ -221,26 +220,7 @@ impl Repository {
     ///
     /// When used with non-local refs
     pub(crate) fn local_from(reporef: &RepoRef) -> Self {
-        use gix::remote::Direction;
         let disk_path = reporef.local_path().unwrap();
-
-        let remote = gix::open(&disk_path)
-            .map_err(anyhow::Error::from)
-            .and_then(|git| {
-                let origin = git
-                    .find_default_remote(Direction::Fetch)
-                    .context("no git remote")??;
-                let url = origin.url(Direction::Fetch).context("no fetch url")?;
-                let remote = url
-                    .to_bstring()
-                    .to_string()
-                    .parse()
-                    .map_err(|_| anyhow::format_err!("remote url not understood"))?;
-
-                debug!(%reporef, origin=?remote, "found git repo with remote");
-                Ok(remote)
-            })
-            .unwrap_or_else(|_| RepoRemote::from(reporef));
 
         Self {
             sync_status: SyncStatus::Queued,
@@ -250,7 +230,6 @@ impl Repository {
             branch_filter: None,
             file_filter: Default::default(),
             disk_path,
-            remote,
         }
     }
 
@@ -379,79 +358,6 @@ pub enum GitProtocol {
     Ssh,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
-#[serde(rename_all = "snake_case")]
-pub enum RepoRemote {
-    Git(GitRemote),
-    None,
-}
-
-impl<T: AsRef<RepoRef>> From<T> for RepoRemote {
-    fn from(reporef: T) -> Self {
-        match reporef.as_ref() {
-            RepoRef {
-                backend: Backend::Github,
-                name,
-            } => RepoRemote::Git(GitRemote {
-                protocol: GitProtocol::Https,
-                host: "github.com".to_owned(),
-                address: name.to_owned(),
-            }),
-            RepoRef {
-                backend: Backend::Local,
-                name: _name,
-            } => RepoRemote::None,
-        }
-    }
-}
-
-impl Display for RepoRemote {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RepoRemote::Git(GitRemote {
-                protocol,
-                host,
-                address,
-            }) => match protocol {
-                GitProtocol::Https => write!(f, "https://{host}/{address}.git"),
-                GitProtocol::Ssh => write!(f, "git@{host}:{address}.git"),
-            },
-            RepoRemote::None => write!(f, "none"),
-        }
-    }
-}
-
-impl FromStr for RepoRemote {
-    type Err = ();
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if let Some(stripped) = value.strip_prefix("https://github.com/") {
-            return Ok(RepoRemote::Git(GitRemote {
-                protocol: GitProtocol::Https,
-                host: "github.com".to_owned(),
-                address: stripped
-                    .trim_end_matches('/')
-                    .trim_end_matches(".git")
-                    .to_owned(),
-            }));
-        }
-
-        if let Some(stripped) = value.strip_prefix("git@github.com:") {
-            return Ok(RepoRemote::Git(GitRemote {
-                protocol: GitProtocol::Ssh,
-                host: "github.com".to_owned(),
-                address: stripped
-                    .trim_start_matches('/')
-                    .trim_end_matches('/')
-                    .trim_end_matches(".git")
-                    .to_owned(),
-            }));
-        }
-
-        Err(())
-    }
-}
-
 #[derive(thiserror::Error, Debug)]
 pub enum RepoError {
     #[error("no source configured")]
@@ -478,7 +384,6 @@ pub enum RepoError {
         error: anyhow::Error,
     },
 }
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -486,16 +391,8 @@ mod test {
     #[test]
     fn parse_reporef() {
         assert_eq!(
-            "github.com/bloopai/bloop".parse::<RepoRef>().unwrap(),
-            RepoRef::new(Backend::Github, "bloopai/bloop").unwrap()
-        );
-        assert_eq!(
-            "local//tmp/repository".parse::<RepoRef>().unwrap(),
-            RepoRef::new(Backend::Local, "/tmp/repository").unwrap()
-        );
-        assert_eq!(
-            "local//tmp/repository".parse::<RepoRef>().unwrap(),
-            RepoRef::new(Backend::Local, "/tmp/repository").unwrap()
+            "/tmp/repository".parse::<RepoRef>().unwrap(),
+            RepoRef::new("/tmp/repository").unwrap()
         );
         if "repository".parse::<RepoRef>().is_ok() {
             panic!("non-absolute local allowed")
@@ -505,36 +402,8 @@ mod test {
     #[test]
     fn serialize_reporef() {
         assert_eq!(
-            r#""github.com/org/repo""#,
-            &serde_json::to_string(&RepoRef::new(Backend::Github, "org/repo").unwrap()).unwrap()
-        );
-        assert_eq!(
             r#""local//org/repo""#,
-            &serde_json::to_string(&RepoRef::new(Backend::Local, "/org/repo").unwrap()).unwrap()
+            &serde_json::to_string(&RepoRef::new("/org/repo").unwrap()).unwrap()
         );
-    }
-
-    #[test]
-    fn parse_reporemote() {
-        let https = RepoRemote::Git(GitRemote {
-            host: "github.com".into(),
-            address: "org/repo".into(),
-            protocol: GitProtocol::Https,
-        });
-
-        let ssh = RepoRemote::Git(GitRemote {
-            host: "github.com".into(),
-            address: "org/repo".into(),
-            protocol: GitProtocol::Ssh,
-        });
-
-        assert_eq!(https, "https://github.com/org/repo".parse().unwrap());
-        assert_eq!(https, "https://github.com/org/repo.git".parse().unwrap());
-        assert_eq!(ssh, "git@github.com:/org/repo.git".parse().unwrap());
-        assert_eq!(ssh, "git@github.com:/org/repo".parse().unwrap());
-        assert_eq!(ssh, "git@github.com:org/repo".parse().unwrap());
-        assert_eq!(ssh, "git@github.com:org/repo.git".parse().unwrap());
-        assert_eq!(ssh, "git@github.com:org/repo.git/".parse().unwrap());
-        assert_eq!(ssh, "git@github.com:/org/repo.git/".parse().unwrap());
     }
 }
